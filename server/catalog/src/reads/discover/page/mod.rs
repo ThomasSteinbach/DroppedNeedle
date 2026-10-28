@@ -8,7 +8,7 @@
 //!
 //! A request never waits for a build. It gets the user's saved page from
 //! the page cache, however old, with ownership marked from the library as
-//! it is now. When the page is missing or more than five minutes old, a
+//! it is now. When the page is missing or more than an hour old, a
 //! rebuild starts in the background and the answer says so
 //! (`refreshing`), so the page polls until the new one lands. With no
 //! page at all the answer is an empty, `loading` page. An empty or failed
@@ -50,10 +50,12 @@ use droppedneedle_kernel::runtime_config::{Live, Plain, secret_sections::Advance
 use library::LibraryReads;
 use memo::BuildMemo;
 
-/// A page older than this is rebuilt behind the next visit, and a failed
-/// build is not retried sooner.
+/// A shown page older than an hour is rebuilt behind the next visit: its
+/// reads are kept for hours and the warm cycle rebuilds every six, so a
+/// rebuild sooner would only repeat the same answers. A failed or empty
+/// build is tried again after five minutes.
 const TIMING: Timing = Timing {
-    fresh_ms: 300_000,
+    fresh_ms: 3_600_000,
     retry_ms: 300_000,
 };
 /// The memos age by their own rules; their cache never builds.
@@ -431,5 +433,25 @@ fn today(now: f64) -> (String, i64) {
             )
         }
         Err(_) => ("1970-01-01".to_owned(), 1970),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TIMING;
+    use crate::reads::discover::listening::{ARTIST_FRESH, STATS_FRESH};
+    use crate::reads::discover::scheduler::WARM_AGAIN_MS;
+
+    // A visit between two warm builds does not rebuild a page minutes old,
+    // and a failed build is tried again sooner than a good one is rebuilt.
+    const _: () = assert!(TIMING.fresh_ms >= 3_600_000 && TIMING.retry_ms < TIMING.fresh_ms);
+
+    /// A warm build finds the previous one's artist-level and statistics
+    /// reads still cached, so it does not pay every paced read again.
+    #[test]
+    fn cached_reads_outlive_the_warm_cycle() {
+        let warm_again = u128::try_from(WARM_AGAIN_MS).unwrap();
+        assert!(ARTIST_FRESH.as_millis() > warm_again);
+        assert!(STATS_FRESH.as_millis() >= warm_again);
     }
 }

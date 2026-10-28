@@ -70,23 +70,46 @@ pub(in crate::reads::discover) const TAG_PAGE: u32 = 100;
 const POPULARITY_DOWN_FOR: Duration = Duration::from_secs(10 * 60);
 
 const HOUR: Duration = Duration::from_secs(3_600);
+/// How long a found artist-level or chart answer is kept. Similar artists,
+/// an artist's albums, popularity, tags and charts move over weeks, while
+/// the warm cycle rebuilds every six hours and a cold build pays every one
+/// of these reads at ListenBrainz's pace of about one a second: kept for a
+/// day, a warm build finds them still there.
+pub(in crate::reads::discover) const ARTIST_FRESH: Duration = Duration::from_secs(24 * 3_600);
+/// How long a found statistic is kept: top artists and albums, weekly
+/// charts and playlists, genres, similar users. ListenBrainz recomputes its
+/// statistics about once a day; a warm build every six hours is fresh
+/// enough for the rest.
+pub(in crate::reads::discover) const STATS_FRESH: Duration = Duration::from_secs(6 * 3_600);
 /// Sitewide charts and artist-level lists.
-const SITEWIDE: Policy = Policy::CHARTS;
+const SITEWIDE: Policy = Policy {
+    fresh: ARTIST_FRESH,
+    ..Policy::CHARTS
+};
 /// Artist-level lists (similar artists, an artist's albums, tags).
 const ARTIST: Policy = Policy {
-    fresh: HOUR,
+    fresh: ARTIST_FRESH,
     miss: HOUR,
 };
-/// A user's statistics that change by the listen.
-const LISTENING: Policy = Policy::LISTENING;
+/// A user's statistics.
+const LISTENING: Policy = Policy {
+    fresh: STATS_FRESH,
+    ..Policy::LISTENING
+};
+/// What the user changes by listening or by a click: latest scrobbles and
+/// loved tracks.
+const ACTIVITY: Policy = Policy {
+    fresh: Duration::from_secs(15 * 60),
+    ..Policy::LISTENING
+};
 /// A user's slower statistics (genres, similar users, fresh releases).
 const LISTENING_SLOW: Policy = Policy {
-    fresh: HOUR,
+    fresh: STATS_FRESH,
     miss: HOUR,
 };
 /// Tag searches.
 const TAGS: Policy = Policy {
-    fresh: Duration::from_secs(2 * 3_600),
+    fresh: ARTIST_FRESH,
     miss: Duration::from_secs(2 * 3_600),
 };
 
@@ -557,7 +580,7 @@ impl ListeningData {
         let key = CacheKey::new(Source::ListenBrainz, &["loved", &lower(username)]).personal();
         let name = username.to_owned();
         let rows = self
-            .list(key, LISTENING, ask, move |network, priority| async move {
+            .list(key, ACTIVITY, ask, move |network, priority| async move {
                 network.loved(&name, PAGE, priority).await
             })
             .await?;
@@ -651,7 +674,7 @@ impl ListeningData {
         self.health.note(&fetched);
         for (mbid, count) in fetched? {
             if let Ok(bytes) = serde_json::to_vec(&count) {
-                self.cache.set_bytes(&key_of(&mbid), bytes, HOUR);
+                self.cache.set_bytes(&key_of(&mbid), bytes, ARTIST_FRESH);
             }
             if let Some(asked) = missing
                 .iter()
@@ -912,7 +935,7 @@ impl ListeningData {
         )
         .personal();
         let (user, name) = (user_id.to_owned(), username.to_owned());
-        self.list(key, LISTENING, ask, move |network, priority| async move {
+        self.list(key, ACTIVITY, ask, move |network, priority| async move {
             network
                 .lastfm_recent_albums(&user, &name, limit, priority)
                 .await
@@ -961,7 +984,7 @@ impl ListeningData {
         )
         .personal();
         let (user, name) = (user_id.to_owned(), username.to_owned());
-        self.list(key, LISTENING, ask, move |network, priority| async move {
+        self.list(key, ACTIVITY, ask, move |network, priority| async move {
             network.lastfm_loved(&user, &name, limit, priority).await
         })
         .await

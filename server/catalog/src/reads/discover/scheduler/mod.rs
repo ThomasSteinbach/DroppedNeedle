@@ -30,7 +30,7 @@ const DEBOUNCE_MS: i64 = 300_000;
 /// Bound on warming one feature.
 const FEATURE_TIMEOUT: Duration = Duration::from_secs(300);
 /// When a warmed feature is due again, ms.
-const WARM_AGAIN_MS: i64 = 6 * 3_600_000;
+pub(in crate::reads::discover) const WARM_AGAIN_MS: i64 = 6 * 3_600_000;
 /// Retry after a feature that did not build, ms.
 const RETRY_MS: i64 = 90_000;
 /// Retry after a feature that timed out, ms.
