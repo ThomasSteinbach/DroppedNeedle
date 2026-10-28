@@ -14,9 +14,9 @@
 //! - Last.fm readiness: a user who cannot read Last.fm gets empty answers
 //!   before the cache is asked, so nothing empty is kept under keys every
 //!   user shares.
-//! - ListenBrainz popularity health: its "switched off" answer marks
-//!   popularity down for a while, and [`SourcePolicy`] lets Last.fm stand
-//!   in.
+//! - ListenBrainz popularity health: its "switched off" answer, or a
+//!   popularity read turned down for its rate, marks popularity down for a
+//!   while, and [`SourcePolicy`] lets Last.fm stand in.
 //! - the build cap: an [`Ask`] made for a build lets at most
 //!   [`BUILD_CAP`] of its provider calls run at once.
 
@@ -66,7 +66,8 @@ const LASTFM_SIMILAR_FLOOR: u32 = 25;
 const LASTFM_USER_FLOOR: u32 = 25;
 /// Rows of a MusicBrainz tag search page (the most it serves).
 pub(in crate::reads::discover) const TAG_PAGE: u32 = 100;
-/// How long a popularity refusal keeps Last.fm standing in.
+/// How long a popularity refusal, or a rate limit that names no wait,
+/// keeps Last.fm standing in.
 const POPULARITY_DOWN_FOR: Duration = Duration::from_secs(10 * 60);
 
 const HOUR: Duration = Duration::from_secs(3_600);
@@ -161,20 +162,22 @@ impl Ask {
 }
 
 /// ListenBrainz popularity health: down for a while after it switched a
-/// popularity read off.
+/// popularity read off or turned one down for its rate.
 #[derive(Default)]
 struct Health {
     popularity_down_until: Mutex<Option<Instant>>,
 }
 
 impl Health {
+    /// Mark popularity down after a failed popularity read, for as long as
+    /// [`popularity_down_for`] says; a later end already set stays.
     fn note<T>(&self, result: &ListeningResult<T>) {
-        if matches!(
-            result,
-            Err(ListeningError::Provider(ProviderError::Disabled { .. }))
-        ) && let Ok(mut until) = self.popularity_down_until.lock()
+        if let Err(ListeningError::Provider(error)) = result
+            && let Some(wait) = popularity_down_for(error)
+            && let Ok(mut until) = self.popularity_down_until.lock()
         {
-            *until = Some(Instant::now() + POPULARITY_DOWN_FOR);
+            let end = Instant::now() + wait;
+            *until = Some(until.map_or(end, |current| current.max(end)));
         }
     }
 
@@ -1127,5 +1130,82 @@ impl ListeningData {
     ) -> ListeningResult<Vec<PlayedArtist>> {
         self.call(ask, self.network.jellyfin_plays(user_id, limit))
             .await
+    }
+}
+
+/// How long a failed popularity read keeps popularity down: a refusal for
+/// [`POPULARITY_DOWN_FOR`]; a rate limit for the wait it names, else as
+/// long as a refusal (a 429 without ListenBrainz's rate headers comes from
+/// in front of the service and does not clear in seconds). Other failures
+/// leave it up.
+fn popularity_down_for(error: &ProviderError) -> Option<Duration> {
+    match error {
+        ProviderError::Disabled { .. } => Some(POPULARITY_DOWN_FOR),
+        ProviderError::RateLimited { retry_after, .. } => {
+            Some(retry_after.unwrap_or(POPULARITY_DOWN_FOR))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(error: ProviderError) -> ListeningResult<()> {
+        Err(ListeningError::Provider(error))
+    }
+
+    #[test]
+    fn a_refusal_keeps_popularity_down_for_the_window() {
+        let refused = ProviderError::Disabled {
+            provider: "listenbrainz",
+            message: "ListenBrainz switched this endpoint off upstream (401)".to_owned(),
+        };
+        assert_eq!(popularity_down_for(&refused), Some(POPULARITY_DOWN_FOR));
+    }
+
+    #[test]
+    fn a_rate_limit_keeps_popularity_down_for_the_wait_it_names() {
+        let limited = ProviderError::RateLimited {
+            provider: "listenbrainz",
+            retry_after: Some(Duration::from_secs(7)),
+        };
+        assert_eq!(popularity_down_for(&limited), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn a_rate_limit_naming_no_wait_keeps_popularity_down_for_the_window() {
+        let limited = ProviderError::RateLimited {
+            provider: "listenbrainz",
+            retry_after: None,
+        };
+        assert_eq!(popularity_down_for(&limited), Some(POPULARITY_DOWN_FOR));
+    }
+
+    #[test]
+    fn an_outage_leaves_popularity_up() {
+        let health = Health::default();
+        health.note(&failed(ProviderError::Unavailable {
+            provider: "listenbrainz",
+            retry_after: None,
+        }));
+        assert!(!health.popularity_down());
+    }
+
+    #[test]
+    fn a_rate_limited_read_marks_popularity_down_and_a_shorter_wait_keeps_it() {
+        let health = Health::default();
+        health.note(&failed(ProviderError::RateLimited {
+            provider: "listenbrainz",
+            retry_after: None,
+        }));
+        assert!(health.popularity_down());
+        let end = *health.popularity_down_until.lock().unwrap();
+        health.note(&failed(ProviderError::RateLimited {
+            provider: "listenbrainz",
+            retry_after: Some(Duration::from_secs(1)),
+        }));
+        assert_eq!(*health.popularity_down_until.lock().unwrap(), end);
     }
 }
