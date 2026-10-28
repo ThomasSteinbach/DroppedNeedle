@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -66,6 +66,9 @@ pub(crate) struct Script {
     pub tag_albums: Vec<TagAlbum>,
     pub release_group: Option<ReleaseGroupFacts>,
     pub musicbrainz_down: AtomicBool,
+    /// While set to a release, release lookups answer `group(9)` and never
+    /// answer for that release.
+    pub release_lookups_stall_at: Mutex<Option<String>>,
     /// When set, ListenBrainz top-artist reads wait here until released.
     pub hold: Option<Arc<Hold>>,
 }
@@ -356,10 +359,15 @@ impl ListeningNetwork for Script {
     }
     fn release_group_of<'a>(
         &'a self,
-        _r: &'a str,
+        release: &'a str,
         _p: RequestPriority,
     ) -> Answer<'a, Option<String>> {
-        ok(None)
+        let stall_at = self.release_lookups_stall_at.lock().unwrap().clone();
+        match stall_at {
+            Some(at) if at == release => Box::pin(std::future::pending()),
+            Some(_) => ok(Some(group(9))),
+            None => ok(None),
+        }
     }
     fn release_group<'a>(
         &'a self,
@@ -846,4 +854,45 @@ async fn a_user_without_lastfm_leaves_no_empty_answer_for_others() {
         .await
         .unwrap();
     assert_eq!(with.len(), 1, "the chart is not an empty kept answer");
+}
+
+/// Release-group answers are remembered one by one: a lookup that never
+/// returns gets the resolution cut off by its caller's bound, and the
+/// answer made before it is kept for the next build.
+#[tokio::test]
+async fn release_group_answers_made_before_a_stalled_lookup_are_kept() {
+    use droppedneedle_catalog::reads::discover::queue::QueueSettings;
+    use droppedneedle_catalog::reads::discover::queue::build::{
+        BuildContext, resolve_release_groups,
+    };
+    use droppedneedle_catalog::reads::discover::queue::store::QueueDb;
+
+    let dir = crate::common::ScratchDir::new("discover-queue-resolve");
+    let runtime = crate::common::scratch_runtime(&dir.join("app.db")).await;
+    let db = QueueDb::new(runtime.db().clone());
+    let script = Script::default();
+    *script.release_lookups_stall_at.lock().unwrap() = Some(group(2));
+    let listening = ListeningData::new(Arc::new(script), Providers::closed().cache);
+    let settings = QueueSettings::from_advanced(&AdvancedSettings::default());
+    let ctx = BuildContext {
+        listening: &listening,
+        db: &db,
+        settings: &settings,
+        ask: Ask::build(RequestPriority::BackgroundSync),
+    };
+
+    let cut = tokio::time::timeout(
+        Duration::from_millis(500),
+        resolve_release_groups(&ctx, &[group(1), group(2)]),
+    )
+    .await;
+    assert!(cut.is_err(), "the stalled lookup holds the resolution up");
+
+    let known = db.resolutions(&[group(1), group(2)]).await.unwrap();
+    assert_eq!(
+        known.get(&group(1)),
+        Some(&Some(group(9))),
+        "made before the stall"
+    );
+    assert!(!known.contains_key(&group(2)), "never answered");
 }
